@@ -155,6 +155,7 @@ public class Program
                     };
 
                     Console.WriteLine($"Tool call: {name} -> {result}");
+                    LogToolCall(name, input, result);
 
                     messages.Add(new JsonObject
                     {
@@ -296,4 +297,21 @@ public class Program
 
         return d[a.Length, b.Length];
     }
+    public static void LogToolCall(string toolName, JsonObject input, string result)
+    {
+        Directory.CreateDirectory("logs");
+
+        var log = new JsonObject
+        {
+            ["timestamp"] = DateTime.UtcNow.ToString("o"),
+            ["tool"] = toolName,
+            ["input"] = input.DeepClone(),
+            ["result"] = result
+        };
+
+        File.AppendAllText(
+            Path.Combine("logs", "tool-calls.jsonl"),
+            log.ToJsonString() + Environment.NewLine);
+    }
+
 }
