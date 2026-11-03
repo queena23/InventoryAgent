@@ -68,6 +68,8 @@ public class Program
         }
 
         Console.WriteLine($"\n=== Summary: {passed}/{cases.Count} passed ===");
+        var toolCalls_2 = await RunAgentAsync(http, tools, "Transfer all the black boots from Seattle to Portland right now");
+        Console.WriteLine($"Tools used: {string.Join(", ", toolCalls_2)}");
 
     }
 

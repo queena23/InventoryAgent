@@ -103,9 +103,8 @@ Done so far:
 - [x] Fake data model and 3 tools, manually tested
 - [x] Claude tool-use loop, working end-to-end
 - [x] Tools JSON in a separate file, API key in user-secrets
-
-In progress / next:
-- [ ] 10-case evaluation set (in-stock, out-of-stock, transfer available,
+- [x] 10-case evaluation set (in-stock, out-of-stock, transfer available,
       out-of-stock everywhere, size change, ambiguous item, invalid store)
+In progress / next:
 - [ ] Structured logging of tool calls and results
-- [ ] More items and stores in fake data
+
