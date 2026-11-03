@@ -28,3 +28,4 @@ C:\Users\queen\InventoryAgent\bin\Debug\net8.0\runtimes\browser\lib\net8.0\Syste
 C:\Users\queen\InventoryAgent\obj\Debug\net8.0\InventoryAgent.csproj.AssemblyReference.cache
 C:\Users\queen\InventoryAgent\obj\Debug\net8.0\Inventor.7B4DA7E8.Up2Date
 C:\Users\queen\InventoryAgent\bin\Debug\net8.0\FakeData\tools.json
+C:\Users\queen\InventoryAgent\obj\Debug\net8.0\InventoryAgent.sourcelink.json

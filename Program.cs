@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Text;
+﻿using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Configuration;
 
@@ -13,29 +9,30 @@ public class Program
 {
     private static readonly List<Store> Stores = new()
     {
-        new("POR", "Portland", "Portland"),
-        new("SEA", "Seattle", "Seattle"),
-        new("BEA", "Beaverton", "Beaverton"),
+        new Store("POR", "Portland", "Portland"),
+        new Store("SEA", "Seattle", "Seattle"),
+        new Store("BEA", "Beaverton", "Beaverton"),
     };
 
     private static readonly List<InventoryItem> Inventory = new()
     {
-        new("POR", "black boots", 8, 0),
-        new("POR", "black boots", 9, 1),
-        new("SEA", "black boots", 8, 2),
-        new("BEA", "black boots", 8, 1),
+        new InventoryItem("POR", "black boots", 8, 0),
+        new InventoryItem("POR", "black boots", 9, 1),
+        new InventoryItem("SEA", "black boots", 8, 2),
+        new InventoryItem("BEA", "black boots", 8, 1),
     };
 
-    public static async Task Main(string[] args)
+    public static async Task Main()
     {
         var config = new ConfigurationBuilder()
             .AddUserSecrets<Program>()
             .Build();
 
-        var apiKey = config["Anthropic:ApiKey"]
-            ?? Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+        string apiKey = config["Anthropic:ApiKey"]
+            ?? Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
+            ?? "";
 
-        if (string.IsNullOrEmpty(apiKey))
+        if (string.IsNullOrWhiteSpace(apiKey))
         {
             Console.WriteLine("Anthropic API key not found in user-secrets or environment.");
             return;
@@ -47,15 +44,51 @@ public class Program
 
         var toolsJson = File.ReadAllText(
             Path.Combine(AppContext.BaseDirectory, "FakeData", "tools.json"));
+        var tools = JsonNode.Parse(toolsJson)!.AsArray();
+
+        // Change this string to test a different eval case:
+        // Portland size 8, Seattle size 8, Portland size 9, Hawaii size 8, etc.
+       
+        var cases = EvalCases.All;
+
+        int passed = 0;
+        foreach (var test in cases)
+        {
+            Console.WriteLine($"\n=== {test.Name} ===");
+            Console.WriteLine($"User: {test.Message}");
+
+            var toolCalls = await RunAgentAsync(http, tools, test.Message);
+
+            bool pass = toolCalls.SequenceEqual(test.ExpectedTools);
+            if (pass) passed++;
+
+            Console.WriteLine($"Expected: {string.Join(", ", test.ExpectedTools)}");
+            Console.WriteLine($"Actual:   {string.Join(", ", toolCalls)}");
+            Console.WriteLine(pass ? "PASS" : "FAIL");
+        }
+
+        Console.WriteLine($"\n=== Summary: {passed}/{cases.Count} passed ===");
+
+    }
+
+    public static async Task<List<string>> RunAgentAsync(HttpClient http, JsonArray tools, string userMessage)
+    {
+        var toolCalls = new List<string>();
 
         var messages = new JsonArray
         {
             new JsonObject
             {
                 ["role"] = "user",
-                ["content"] = "A customer in seattle wants the black boots in size 8, what can we do?"
+                ["content"] = userMessage
             }
         };
+
+        string system = "You are an inventory assistant. Use tools to check stock. " +
+            "Suggest transfers only, never execute them. " +
+            "Ground every answer in tool results. " +
+            "If a tool returns an ERROR about an unknown store or item, stop. " +
+            "Do not call any further tools. Tell the user you cannot confirm stock.";
 
         for (int turn = 0; turn < 5; turn++)
         {
@@ -63,110 +96,136 @@ public class Program
             {
                 ["model"] = "claude-sonnet-4-5",
                 ["max_tokens"] = 1000,
-                ["system"] = "You are an inventory assistant. Use the tools to check real stock. Only suggest transfers, never execute them. Ground your final answer in tool results.",
+                ["system"] = system,
                 ["messages"] = messages.DeepClone(),
-                ["tools"] = JsonNode.Parse(toolsJson)
+                ["tools"] = tools.DeepClone()
             };
 
             var response = await http.PostAsync(
                 "https://api.anthropic.com/v1/messages",
                 new StringContent(request.ToJsonString(), Encoding.UTF8, "application/json"));
 
-            var body = await response.Content.ReadAsStringAsync();
-            if (!response.IsSuccessStatusCode)
+            var json = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+            if (json["error"] is not null)
             {
-                Console.WriteLine($"API error: {response.StatusCode}");
-                Console.WriteLine(body);
-                return;
+                Console.WriteLine($"API error: {json["error"]!["type"]}");
+                Console.WriteLine(json["error"]!.ToJsonString());
+                break;
             }
 
-            var json = JsonNode.Parse(body)!.AsObject();
             var content = json["content"]!.AsArray();
+            messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = content.DeepClone() });
 
-            messages.Add(new JsonObject
-            {
-                ["role"] = "assistant",
-                ["content"] = content.DeepClone()
-            });
-
-            var toolResults = new JsonArray();
-            var hasToolUse = false;
+            bool madeToolCall = false;
 
             foreach (var block in content)
             {
-                var type = block!["type"]?.GetValue<string>();
-                if (type == "text")
+                if (block!["type"]?.ToString() == "text")
                 {
-                    Console.WriteLine(block["text"]?.GetValue<string>());
+                    Console.WriteLine(block!["text"]!.ToString());
                 }
-                else if (type == "tool_use")
+                else if (block!["type"]?.ToString() == "tool_use")
                 {
-                    hasToolUse = true;
-                    var name = block["name"]!.GetValue<string>();
-                    var id = block["id"]!.GetValue<string>();
-                    var input = block["input"]!.AsObject();
+                    madeToolCall = true;
+                    string name = block!["name"]!.ToString();
+                    string id = block!["id"]!.ToString();
+                    var input = block!["input"]!.AsObject();
+
+                    toolCalls.Add(name);
 
                     string result = name switch
                     {
-                        "check_stock" => CheckStock(
-                            input["item"]!.GetValue<string>(),
-                            input["storeId"]!.GetValue<string>(),
-                            input["size"]!.GetValue<int>()).ToString(),
-                        "find_stores_with_item" => string.Join(", ",
-                            FindStoresWithItem(
-                                input["item"]!.GetValue<string>(),
-                                input["size"]!.GetValue<int>())
-                            .Select(i => $"{i.StoreId}: {i.Quantity}")),
+                        "check_stock" => CheckStockTool(
+                            input["item"]!.ToString(),
+                            input["storeId"]!.ToString(),
+                            input["size"]!.GetValue<int>()),
+                        "find_stores_with_item" => FindStoresWithItemResult(
+                            input["item"]!.ToString(),
+                            input["size"]!.GetValue<int>()),
                         "suggest_transfer" => SuggestTransfer(
-                            input["item"]!.GetValue<string>(),
+                            input["item"]!.ToString(),
                             input["size"]!.GetValue<int>(),
-                            input["from"]!.GetValue<string>(),
-                            input["to"]!.GetValue<string>(),
+                            input["from"]!.ToString(),
+                            input["to"]!.ToString(),
                             input["quantity"]!.GetValue<int>()),
                         _ => "Unknown tool"
                     };
 
                     Console.WriteLine($"Tool call: {name} -> {result}");
 
-                    toolResults.Add(new JsonObject
+                    messages.Add(new JsonObject
                     {
-                        ["type"] = "tool_result",
-                        ["tool_use_id"] = id,
-                        ["content"] = result
+                        ["role"] = "user",
+                        ["content"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["type"] = "tool_result",
+                                ["tool_use_id"] = id,
+                                ["content"] = result
+                            }
+                        }
                     });
                 }
             }
 
-            if (!hasToolUse)
+            if (!madeToolCall)
             {
                 break;
             }
-
-            messages.Add(new JsonObject
-            {
-                ["role"] = "user",
-                ["content"] = toolResults
-            });
         }
+
+        return toolCalls;
     }
 
     public static int CheckStock(string item, string storeId, int size)
     {
-        // Normalize first, so "Seattle", "SEA", "seattle", "Seatle" all mean SEA
         storeId = NormalizeStoreId(storeId);
 
         return Inventory.FirstOrDefault(i =>
             i.Item == item && i.StoreId == storeId && i.Size == size)
             ?.Quantity ?? 0;
     }
+
+    // Wrapper around CheckStock that distinguishes "unknown" from "0 stock"
+    // 0 = real store/item, but out of stock -> agent MAY go to find_stores
+    // ERROR = unknown store/item -> agent must stop, do not call further tools
+    public static string CheckStockTool(string item, string storeIdRaw, int size)
+    {
+        string storeId = NormalizeStoreId(storeIdRaw);
+
+        if (!Stores.Any(s => s.Id == storeId))
+        {
+            return $"ERROR: Unknown store '{storeIdRaw}'. Stop. Do not call any further tools. " +
+                $"Tell the user you cannot find that store and cannot confirm stock.";
+        }
+
+        if (!Inventory.Any(i => i.Item == item))
+        {
+            return $"ERROR: Unknown item '{item}'. Stop. Do not call any further tools. " +
+                $"Tell the user you cannot find that item and cannot confirm stock.";
+        }
+
+        return CheckStock(item, storeId, size).ToString();
+    }
+
     public static List<InventoryItem> FindStoresWithItem(string item, int size) =>
         Inventory.Where(i =>
             i.Item == item && i.Size == size && i.Quantity > 0).ToList();
 
-    public static string SuggestTransfer(string item, int size,
-        string from, string to, int quantity)
+    public static string FindStoresWithItemResult(string item, int size)
     {
-        // Normalize both ends, so a typo in a city name doesn't create a bad suggestion
+        var found = FindStoresWithItem(item, size);
+        if (found.Count == 0)
+        {
+            return "None";
+        }
+        return string.Join(", ", found.Select(i => $"{i.StoreId}: {i.Quantity}"));
+    }
+
+    public static string SuggestTransfer(string item, int size, string from, string to, int quantity)
+    {
         from = NormalizeStoreId(from);
         to = NormalizeStoreId(to);
 
@@ -175,7 +234,7 @@ public class Program
     }
 
     // Normalize a store name / ID to a canonical store ID
-    // Returns POR, SEA, or BEA if it can be matched, otherwise returns the input as-is
+    // "Seattle", "SEA", "seattle", "Seatle" all mean SEA
     public static string NormalizeStoreId(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -185,7 +244,6 @@ public class Program
 
         var normalized = input.Trim().ToLowerInvariant();
 
-        // Exact matches first: city names and IDs, case-insensitive
         var known = new Dictionary<string, string>
         {
             ["portland"] = "POR",
@@ -201,8 +259,7 @@ public class Program
             return exact;
         }
 
-        // Fuzzy match for typos: if it's 1-2 edits away from a known city, use that city
-        // e.g. "Seatle" -> "Seattle" -> "SEA", "Portand" -> "Portland" -> "POR"
+        // Fuzzy match for typos: 1-2 edits away from a known city
         string[] cities = { "portland", "seattle", "beaverton" };
         var best = cities
             .Select(c => new { City = c, Distance = Levenshtein(normalized, c) })
@@ -214,12 +271,9 @@ public class Program
             return known[best.City];
         }
 
-        // Unknown: return as-is, so CheckStock will return 0 for it
-        // In a real product, this is where you'd return an "Unknown store, did you mean...?" error instead
         return input.Trim().ToUpperInvariant();
     }
 
-    // Simple edit-distance (Levenshtein) for typo matching
     public static int Levenshtein(string a, string b)
     {
         var d = new int[a.Length + 1, b.Length + 1];
@@ -240,5 +294,4 @@ public class Program
 
         return d[a.Length, b.Length];
     }
-
 }

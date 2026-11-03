@@ -1,7 +1,7 @@
 [
   {
     "name": "check_stock",
-    "description": "Check quantity of an item in a specific store",
+    "description": "Check quantity of an item in a specific store. If you cannot find the store, item, or size, or the tool returns no matching quantity, stop. Do not call find_stores_with_item or suggest_transfer. Tell the user you cannot confirm stock for that store/item",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -14,7 +14,7 @@
   },
   {
     "name": "find_stores_with_item",
-    "description": "Find stores with quantity > 0 for an item and size",
+    "description": "Find stores with quantity > 0 for an item and size. Use this only when the customer's requested store is out of stock (check_stock = 0). Do not use this when the requested store already has stock",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -26,7 +26,7 @@
   },
   {
     "name": "suggest_transfer",
-     "description": "Suggest, never execute, moving stock from one store to another for human approval. Use this only when the customer's requested store is out of stock (check_stock = 0) and another store has the item in stock. Do not use this when the requested store already has stock, and do not execute the transfer yourself.",
+     "description": "Suggest, never execute, moving stock from one store to another for human approval. Use this only when the customer's requested store is out of stock (check_stock = 0) and another store has the item in stock. Do not use this when the requested store already has stock, and do not execute the transfer yourself. Call this tool directly without asking the user for confirmation first. Calling it only generates a suggestion text, it does not execute a transfer.",
     "input_schema": {
       "type": "object",
       "properties": {
