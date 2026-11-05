@@ -105,7 +105,5 @@ Done so far:
 - [x] Tools JSON in a separate file, API key in user-secrets
 - [x] 10-case evaluation set (in-stock, out-of-stock, transfer available,
       out-of-stock everywhere, size change, ambiguous item, invalid store)
-      
-In progress / next:
-- [ ] Structured logging of tool calls and results
+- [x] Structured logging of tool calls and results
 
