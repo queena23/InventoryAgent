@@ -1,26 +1,14 @@
 ﻿using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Data.SqlClient;
 
-public record Store(string Id, string Name, string City);
 public record InventoryItem(string StoreId, string Item, int Size, int Quantity);
 
 public class Program
 {
-    private static readonly List<Store> Stores = new()
-    {
-        new Store("POR", "Portland", "Portland"),
-        new Store("SEA", "Seattle", "Seattle"),
-        new Store("BEA", "Beaverton", "Beaverton"),
-    };
+    public static string? SqlConnectionString;
 
-    private static readonly List<InventoryItem> Inventory = new()
-    {
-        new InventoryItem("POR", "black boots", 8, 0),
-        new InventoryItem("POR", "black boots", 9, 1),
-        new InventoryItem("SEA", "black boots", 8, 2),
-        new InventoryItem("BEA", "black boots", 8, 1),
-    };
 
     public static async Task Main()
     {
@@ -31,6 +19,8 @@ public class Program
         string apiKey = config["Anthropic:ApiKey"]
             ?? Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
             ?? "";
+        // SQL connection string from user-secrets
+        SqlConnectionString = config["Sql:ConnectionString"];
 
         if (string.IsNullOrWhiteSpace(apiKey))
         {
@@ -181,14 +171,44 @@ public class Program
 
         return toolCalls;
     }
+public static string FindStoresWithItemResult(string item, int size)
+{
+    var found = FindStoresWithItem(item, size);
+    if (found.Count == 0)
+    {
+        return "None";
+    }
+    return string.Join(", ", found.Select(i => $"{i.StoreId}: {i.Quantity}"));
+}
+
+public static string SuggestTransfer(string item, int size, string from, string to, int quantity)
+{
+    from = NormalizeStoreId(from);
+    to = NormalizeStoreId(to);
+
+    return $"SUGGESTION (not executed): Move {quantity} x {item}, " +
+        $"size {size}, from {from} to {to}, for human approval.";
+}
 
     public static int CheckStock(string item, string storeId, int size)
     {
         storeId = NormalizeStoreId(storeId);
 
-        return Inventory.FirstOrDefault(i =>
-            i.Item == item && i.StoreId == storeId && i.Size == size)
-            ?.Quantity ?? 0;
+        using var conn = new SqlConnection(SqlConnectionString);
+        conn.Open();
+
+        using var cmd = new SqlCommand(
+            "SELECT Quantity FROM Inventory WHERE StoreId = @storeId AND Item = @item AND Size = @size",
+            conn);
+        cmd.Parameters.AddWithValue("@storeId", storeId);
+        cmd.Parameters.AddWithValue("@item", item);
+        cmd.Parameters.AddWithValue("@size", size);
+
+        var result = cmd.ExecuteScalar();
+        if (result == null || result == DBNull.Value)
+            return 0; // no row for this size = real out-of-stock
+
+        return Convert.ToInt32(result);
     }
 
     // Wrapper around CheckStock that distinguishes "unknown" from "0 stock"
@@ -198,45 +218,64 @@ public class Program
     {
         string storeId = NormalizeStoreId(storeIdRaw);
 
-        if (!Stores.Any(s => s.Id == storeId))
+        // Check store exists in SQL Stores table (was Stores.Any before)
+        using (var conn = new SqlConnection(SqlConnectionString))
         {
-            return $"ERROR: Unknown store '{storeIdRaw}'. Stop. Do not call any further tools. " +
-                $"Tell the user you cannot find that store and cannot confirm stock.";
+            conn.Open();
+            using var cmd = new SqlCommand(
+                "SELECT COUNT(*) FROM Stores WHERE Id = @storeId", conn);
+            cmd.Parameters.AddWithValue("@storeId", storeId);
+            if (Convert.ToInt32(cmd.ExecuteScalar()) == 0)
+            {
+                return $"ERROR: Unknown store '{storeIdRaw}'. Stop. Do not call any further tools. " +
+                    $"Tell the user you cannot find that store and cannot confirm stock.";
+            }
         }
 
-        if (!Inventory.Any(i => i.Item == item))
+        // Check item exists in SQL Inventory table (was Inventory.Any before)
+        using (var conn = new SqlConnection(SqlConnectionString))
         {
-            return $"ERROR: Unknown item '{item}'. Stop. Do not call any further tools. " +
-                $"Tell the user you cannot find that item and cannot confirm stock.";
+            conn.Open();
+            using var cmd = new SqlCommand(
+                "SELECT COUNT(*) FROM Inventory WHERE Item = @item", conn);
+            cmd.Parameters.AddWithValue("@item", item);
+            if (Convert.ToInt32(cmd.ExecuteScalar()) == 0)
+            {
+                return $"ERROR: Unknown item '{item}'. Stop. Do not call any further tools. " +
+                    $"Tell the user you cannot find that item and cannot confirm stock.";
+            }
         }
 
         return CheckStock(item, storeId, size).ToString();
     }
 
-    public static List<InventoryItem> FindStoresWithItem(string item, int size) =>
-        Inventory.Where(i =>
-            i.Item == item && i.Size == size && i.Quantity > 0).ToList();
-
-    public static string FindStoresWithItemResult(string item, int size)
+    public static List<InventoryItem> FindStoresWithItem(string item, int size)
     {
-        var found = FindStoresWithItem(item, size);
-        if (found.Count == 0)
+        var found = new List<InventoryItem>();
+
+        using var conn = new SqlConnection(SqlConnectionString);
+        conn.Open();
+
+        using var cmd = new SqlCommand(
+            "SELECT StoreId, Item, Size, Quantity FROM Inventory WHERE Item = @item AND Size = @size AND Quantity > 0",
+            conn);
+        cmd.Parameters.AddWithValue("@item", item);
+        cmd.Parameters.AddWithValue("@size", size);
+
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
         {
-            return "None";
+            found.Add(new InventoryItem(
+                reader.GetString(0),  // StoreId
+                reader.GetString(1),  // Item
+                reader.GetInt32(2),   // Size
+                reader.GetInt32(3)    // Quantity
+            ));
         }
-        return string.Join(", ", found.Select(i => $"{i.StoreId}: {i.Quantity}"));
+
+        return found;
     }
-
-    public static string SuggestTransfer(string item, int size, string from, string to, int quantity)
-    {
-        from = NormalizeStoreId(from);
-        to = NormalizeStoreId(to);
-
-        return $"SUGGESTION (not executed): Move {quantity} x {item}, " +
-            $"size {size}, from {from} to {to}, for human approval.";
-    }
-
-    // Normalize a store name / ID to a canonical store ID
+// Normalize a store name / ID to a canonical store ID
     // "Seattle", "SEA", "seattle", "Seatle" all mean SEA
     public static string NormalizeStoreId(string input)
     {
@@ -296,7 +335,7 @@ public class Program
         }
 
         return d[a.Length, b.Length];
-    }
+    } 
     public static void LogToolCall(string toolName, JsonObject input, string result)
     {
         Directory.CreateDirectory("logs");
