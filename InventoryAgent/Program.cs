@@ -1,13 +1,13 @@
 ﻿using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Data.SqlClient;
 
 public record InventoryItem(string StoreId, string Item, int Size, int Quantity);
 
 public class Program
 {
-    public static string? SqlConnectionString;
+    private const string FunctionsBaseUrl = "https://inventory-agent-func-fxamcvbvb2b8gsae.centralus-01.azurewebsites.net/api";
+    private static readonly HttpClient FunctionsHttp = new() { Timeout = TimeSpan.FromSeconds(100) };
 
 
     public static async Task Main()
@@ -19,8 +19,7 @@ public class Program
         string apiKey = config["Anthropic:ApiKey"]
             ?? Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY")
             ?? "";
-        // SQL connection string from user-secrets
-        SqlConnectionString = config["Sql:ConnectionString"];
+       
 
         if (string.IsNullOrWhiteSpace(apiKey))
         {
@@ -126,23 +125,33 @@ public class Program
 
                     toolCalls.Add(name);
 
-                    string result = name switch
+                    string result;
+                    switch (name)
                     {
-                        "check_stock" => CheckStockTool(
-                            input["item"]!.ToString(),
-                            input["storeId"]!.ToString(),
-                            input["size"]!.GetValue<int>()),
-                        "find_stores_with_item" => FindStoresWithItemResult(
-                            input["item"]!.ToString(),
-                            input["size"]!.GetValue<int>()),
-                        "suggest_transfer" => SuggestTransfer(
-                            input["item"]!.ToString(),
-                            input["size"]!.GetValue<int>(),
-                            input["from"]!.ToString(),
-                            input["to"]!.ToString(),
-                            input["quantity"]!.GetValue<int>()),
-                        _ => "Unknown tool"
-                    };
+                        case "check_stock":
+                            result = await CheckStockTool(
+                                input["item"]!.ToString(),
+                                input["storeId"]!.ToString(),
+                                input["size"]!.GetValue<int>());
+                            break;
+                        case "find_stores_with_item":
+                            result = await FindStoresWithItemResult(
+                                input["item"]!.ToString(),
+                                input["size"]!.GetValue<int>());
+                            break;
+                        case "suggest_transfer":
+                            result = await SuggestTransfer(
+                                input["item"]!.ToString(),
+                                input["size"]!.GetValue<int>(),
+                                input["from"]!.ToString(),
+                                input["to"]!.ToString(),
+                                input["quantity"]!.GetValue<int>());
+                            break;
+                        default:
+                            result = "Unknown tool";
+                            break;
+                    }
+
 
                     Console.WriteLine($"Tool call: {name} -> {result}");
                     LogToolCall(name, input, result);
@@ -171,111 +180,81 @@ public class Program
 
         return toolCalls;
     }
-public static string FindStoresWithItemResult(string item, int size)
-{
-    var found = FindStoresWithItem(item, size);
-    if (found.Count == 0)
+    private static async Task<string> GetFromFunctionAsync(string url)
     {
-        return "None";
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                using var response = await FunctionsHttp.GetAsync(url);
+                string body = (await response.Content.ReadAsStringAsync()).Trim();
+                if (response.IsSuccessStatusCode)
+                {
+                    return body;
+                }
+                // Non-success (e.g. 500 on first wake-up) — retry once
+                if (attempt == 0) continue;
+                return body;
+            }
+            catch (Exception) when (attempt == 0)
+            {
+                // Timeout / connection error on first try — retry once
+                continue;
+            }
+        }
+        return "ERROR: Could not reach the function. Stop. Do not call any further tools.";
     }
-    return string.Join(", ", found.Select(i => $"{i.StoreId}: {i.Quantity}"));
-}
 
-public static string SuggestTransfer(string item, int size, string from, string to, int quantity)
-{
-    from = NormalizeStoreId(from);
-    to = NormalizeStoreId(to);
-
-    return $"SUGGESTION (not executed): Move {quantity} x {item}, " +
-        $"size {size}, from {from} to {to}, for human approval.";
-}
-
-    public static int CheckStock(string item, string storeId, int size)
+    public static async Task<string> FindStoresWithItemResult(string item, int size)
     {
-        storeId = NormalizeStoreId(storeId);
+        string url = $"{FunctionsBaseUrl}/find_stores_with_item?item={Uri.EscapeDataString(item)}&size={size}";
+        return await GetFromFunctionAsync(url);
+    }
 
-        using var conn = new SqlConnection(SqlConnectionString);
-        conn.Open();
+    public static async Task<string> SuggestTransfer(string item, int size, string from, string to, int quantity)
+    {
+        string url = $"{FunctionsBaseUrl}/suggest_transfer?item={Uri.EscapeDataString(item)}&size={size}&from={Uri.EscapeDataString(from)}&to={Uri.EscapeDataString(to)}&quantity={quantity}";
+        return await GetFromFunctionAsync(url);
+    }
 
-        using var cmd = new SqlCommand(
-            "SELECT Quantity FROM Inventory WHERE StoreId = @storeId AND Item = @item AND Size = @size",
-            conn);
-        cmd.Parameters.AddWithValue("@storeId", storeId);
-        cmd.Parameters.AddWithValue("@item", item);
-        cmd.Parameters.AddWithValue("@size", size);
-
-        var result = cmd.ExecuteScalar();
-        if (result == null || result == DBNull.Value)
-            return 0; // no row for this size = real out-of-stock
-
-        return Convert.ToInt32(result);
+    public static async Task<int> CheckStock(string item, string storeId, int size)
+    {
+        string result = await CheckStockTool(item, storeId, size);
+        return int.TryParse(result, out int qty) ? qty : 0;
     }
 
     // Wrapper around CheckStock that distinguishes "unknown" from "0 stock"
     // 0 = real store/item, but out of stock -> agent MAY go to find_stores
     // ERROR = unknown store/item -> agent must stop, do not call further tools
-    public static string CheckStockTool(string item, string storeIdRaw, int size)
+    // The Function already does the store/item existence checks and returns
+    // the exact ERROR text, so this just passes its response through.
+    public static async Task<string> CheckStockTool(string item, string storeIdRaw, int size)
     {
-        string storeId = NormalizeStoreId(storeIdRaw);
-
-        // Check store exists in SQL Stores table (was Stores.Any before)
-        using (var conn = new SqlConnection(SqlConnectionString))
-        {
-            conn.Open();
-            using var cmd = new SqlCommand(
-                "SELECT COUNT(*) FROM Stores WHERE Id = @storeId", conn);
-            cmd.Parameters.AddWithValue("@storeId", storeId);
-            if (Convert.ToInt32(cmd.ExecuteScalar()) == 0)
-            {
-                return $"ERROR: Unknown store '{storeIdRaw}'. Stop. Do not call any further tools. " +
-                    $"Tell the user you cannot find that store and cannot confirm stock.";
-            }
-        }
-
-        // Check item exists in SQL Inventory table (was Inventory.Any before)
-        using (var conn = new SqlConnection(SqlConnectionString))
-        {
-            conn.Open();
-            using var cmd = new SqlCommand(
-                "SELECT COUNT(*) FROM Inventory WHERE Item = @item", conn);
-            cmd.Parameters.AddWithValue("@item", item);
-            if (Convert.ToInt32(cmd.ExecuteScalar()) == 0)
-            {
-                return $"ERROR: Unknown item '{item}'. Stop. Do not call any further tools. " +
-                    $"Tell the user you cannot find that item and cannot confirm stock.";
-            }
-        }
-
-        return CheckStock(item, storeId, size).ToString();
+        string url = $"{FunctionsBaseUrl}/check_stock?item={Uri.EscapeDataString(item)}&storeId={Uri.EscapeDataString(storeIdRaw)}&size={size}";
+        return await GetFromFunctionAsync(url);
     }
 
-    public static List<InventoryItem> FindStoresWithItem(string item, int size)
+    public static async Task<List<InventoryItem>> FindStoresWithItem(string item, int size)
     {
+        string result = await FindStoresWithItemResult(item, size);
         var found = new List<InventoryItem>();
-
-        using var conn = new SqlConnection(SqlConnectionString);
-        conn.Open();
-
-        using var cmd = new SqlCommand(
-            "SELECT StoreId, Item, Size, Quantity FROM Inventory WHERE Item = @item AND Size = @size AND Quantity > 0",
-            conn);
-        cmd.Parameters.AddWithValue("@item", item);
-        cmd.Parameters.AddWithValue("@size", size);
-
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
+        if (string.IsNullOrWhiteSpace(result) || result == "None" || result.StartsWith("ERROR"))
         {
-            found.Add(new InventoryItem(
-                reader.GetString(0),  // StoreId
-                reader.GetString(1),  // Item
-                reader.GetInt32(2),   // Size
-                reader.GetInt32(3)    // Quantity
-            ));
+            return found;
         }
-
+        // Function returns "SEA: 2, BEA: 1"
+        foreach (var part in result.Split(", ", StringSplitOptions.RemoveEmptyEntries))
+        {
+            var kv = part.Split(": ", StringSplitOptions.RemoveEmptyEntries);
+            if (kv.Length == 2 && int.TryParse(kv[1], out int qty))
+            {
+                found.Add(new InventoryItem(kv[0].Trim(), item, size, qty));
+            }
+        }
         return found;
     }
-// Normalize a store name / ID to a canonical store ID
+
+    // Normalize a store name / ID to a canonical store ID
     // "Seattle", "SEA", "seattle", "Seatle" all mean SEA
     public static string NormalizeStoreId(string input)
     {
